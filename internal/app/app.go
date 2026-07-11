@@ -28,7 +28,7 @@ import (
 	"github.com/khashino/AISH/internal/provider/openaicompat"
 )
 
-const version = "0.6.0-dev"
+const version = "0.6.3-dev"
 
 func Run(args []string) error {
 	cfg, e := config.Load()
@@ -257,22 +257,110 @@ type proposal struct {
 	Dangerous bool   `json:"dangerous"`
 }
 
+func parseProposal(raw, task string) (proposal, error) {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return proposal{}, fmt.Errorf("model returned an empty command proposal")
+	}
+
+	// Preferred format: strict JSON.
+	var p proposal
+	if json.Unmarshal([]byte(text), &p) == nil && strings.TrimSpace(p.Command) != "" {
+		p.Command = strings.TrimSpace(p.Command)
+		return p, nil
+	}
+
+	// Some small/local models wrap JSON in a Markdown fence.
+	if start := strings.Index(text, "{"); start >= 0 {
+		if end := strings.LastIndex(text, "}"); end > start {
+			if json.Unmarshal([]byte(text[start:end+1]), &p) == nil && strings.TrimSpace(p.Command) != "" {
+				p.Command = strings.TrimSpace(p.Command)
+				return p, nil
+			}
+		}
+	}
+
+	// Fallback for models that return only a command or a fenced shell block.
+	lines := strings.Split(text, "\n")
+	var commandLines []string
+	inFence := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			if trimmed != "" {
+				commandLines = append(commandLines, trimmed)
+			}
+		}
+	}
+	command := strings.Join(commandLines, "\n")
+	if command == "" {
+		command = strings.Trim(text, "` \t\r\n")
+		if i := strings.IndexByte(command, '\n'); i >= 0 {
+			command = strings.TrimSpace(command[:i])
+		}
+	}
+	if command == "" {
+		return proposal{}, fmt.Errorf("model returned invalid command proposal: %s", raw)
+	}
+	return proposal{Command: command, Reason: "Generated for: " + task}, nil
+}
+
+func deterministicProposal(task string) (proposal, bool) {
+	n := strings.ToLower(strings.TrimSpace(task))
+	mentionsLargest := strings.Contains(n, "largest") || strings.Contains(n, "biggest")
+	mentionsFiles := strings.Contains(n, "file")
+	mentionsCurrentFolder := strings.Contains(n, "this folder") || strings.Contains(n, "current folder") || strings.Contains(n, "current directory") || strings.Contains(n, "here")
+	if !mentionsLargest || !mentionsFiles || !mentionsCurrentFolder {
+		return proposal{}, false
+	}
+	if runtime.GOOS == "windows" {
+		return proposal{
+			Command: `powershell -NoProfile -Command "Get-ChildItem -File | Sort-Object Length -Descending | Select-Object -First 10 Name,Length"`,
+			Reason:  "List the ten largest files in the current folder by byte size.",
+		}, true
+	}
+	return proposal{
+		Command: `find . -maxdepth 1 -type f -printf '%s\t%p\n' | sort -nr | head -n 10`,
+		Reason:  "List the ten largest files in the current folder by byte size.",
+	}, true
+}
+
 func doCommand(cfg config.Config, task string) error {
 	c, e := client(cfg)
 	if e != nil {
 		return e
 	}
-	sys := `You translate a user task into exactly one terminal command for the current OS. Return only JSON: {"command":"...","reason":"...","dangerous":false}. Never use markdown. OS=` + runtime.GOOS
-	raw, e := c.Chat(context.Background(), []provider.Message{{Role: "system", Content: sys}, {Role: "user", Content: task}})
-	if e != nil {
-		return e
-	}
 	var p proposal
-	if e = json.Unmarshal([]byte(strings.TrimSpace(raw)), &p); e != nil {
-		return fmt.Errorf("model returned invalid command proposal: %s", raw)
-	}
-	if e = executor.Validate(p.Command); e != nil {
-		return e
+	if builtIn, ok := deterministicProposal(task); ok {
+		p = builtIn
+	} else {
+		sys := `You translate a user task into exactly one terminal command for the current OS. Return only JSON: {"command":"...","reason":"...","dangerous":false}. Never use markdown. Prefer simple portable commands. For numeric sorting, prefer sort -n or sort -nr instead of complex -k expressions. OS=` + runtime.GOOS
+		messages := []provider.Message{{Role: "system", Content: sys}, {Role: "user", Content: task}}
+		for attempt := 1; attempt <= 3; attempt++ {
+			raw, chatErr := c.Chat(context.Background(), messages)
+			if chatErr != nil {
+				return chatErr
+			}
+			p, e = parseProposal(raw, task)
+			if e == nil {
+				e = executor.Validate(p.Command)
+			}
+			if e == nil {
+				break
+			}
+			if attempt == 3 {
+				return fmt.Errorf("model could not produce a valid command after 3 attempts: %w", e)
+			}
+			fmt.Printf("AISH rejected an invalid command and is asking the model to correct it (%d/2).\n", attempt)
+			messages = append(messages,
+				provider.Message{Role: "assistant", Content: raw},
+				provider.Message{Role: "user", Content: "The proposed command was rejected: " + e.Error() + ". Return corrected JSON only. Use one syntactically valid command for " + runtime.GOOS + ". Do not use Markdown or backticks."},
+			)
+		}
 	}
 	if !executor.Confirm(p.Command, p.Reason, p.Dangerous) {
 		fmt.Println("Cancelled.")

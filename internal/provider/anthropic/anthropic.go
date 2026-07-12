@@ -15,15 +15,17 @@ import (
 type Client struct {
 	BaseURL, Model, APIKey string
 	HTTP                   *http.Client
+	last                   provider.Usage
 }
 
 func New(baseURL, model, apiKey string) *Client {
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com/v1"
 	}
-	return &Client{strings.TrimRight(baseURL, "/"), model, apiKey, &http.Client{Timeout: 10 * time.Minute}}
+	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Model: model, APIKey: apiKey, HTTP: &http.Client{Timeout: 10 * time.Minute}}
 }
-func (c *Client) Name() string { return "claude" }
+func (c *Client) Name() string              { return "claude" }
+func (c *Client) LastUsage() provider.Usage { return c.last }
 func (c *Client) Chat(ctx context.Context, messages []provider.Message) (string, error) {
 	var system string
 	filtered := make([]provider.Message, 0, len(messages))
@@ -60,6 +62,10 @@ func (c *Client) Chat(ctx context.Context, messages []provider.Message) (string,
 	}
 	var out struct {
 		Content []struct{ Type, Text string } `json:"content"`
+		Usage   struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
@@ -70,6 +76,7 @@ func (c *Client) Chat(ctx context.Context, messages []provider.Message) (string,
 			b.WriteString(x.Text)
 		}
 	}
+	c.last = provider.Usage{InputTokens: out.Usage.InputTokens, OutputTokens: out.Usage.OutputTokens, TotalTokens: out.Usage.InputTokens + out.Usage.OutputTokens}
 	return b.String(), nil
 }
 func (c *Client) Stream(ctx context.Context, m []provider.Message, emit provider.StreamFunc) (string, error) {

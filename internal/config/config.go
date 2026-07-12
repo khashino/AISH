@@ -8,9 +8,11 @@ import (
 )
 
 type ProviderConfig struct {
-	BaseURL   string `json:"base_url"`
-	Model     string `json:"model"`
-	APIKeyEnv string `json:"api_key_env"`
+	BaseURL              string  `json:"base_url"`
+	Model                string  `json:"model"`
+	APIKeyEnv            string  `json:"api_key_env"`
+	InputCostPerMillion  float64 `json:"input_cost_per_million,omitempty"`
+	OutputCostPerMillion float64 `json:"output_cost_per_million,omitempty"`
 }
 type DocumentsConfig struct {
 	Folder            string `json:"folder"`
@@ -23,6 +25,7 @@ type Config struct {
 	Providers      map[string]ProviderConfig `json:"providers"`
 	RequireConfirm bool                      `json:"require_confirmation"`
 	Documents      DocumentsConfig           `json:"documents"`
+	ShowUsage      string                    `json:"show_usage"`
 }
 
 func Default() Config {
@@ -32,7 +35,7 @@ func Default() Config {
 		"openai":   {BaseURL: "https://api.openai.com/v1", Model: "gpt-4.1-mini", APIKeyEnv: "OPENAI_API_KEY"},
 		"claude":   {BaseURL: "https://api.anthropic.com/v1", Model: "claude-sonnet-4-5", APIKeyEnv: "ANTHROPIC_API_KEY"},
 		"gemini":   {BaseURL: "https://generativelanguage.googleapis.com/v1beta", Model: "gemini-2.5-flash", APIKeyEnv: "GEMINI_API_KEY"},
-	}, RequireConfirm: true, Documents: DocumentsConfig{Folder: "documents", EmbeddingProvider: "ollama", EmbeddingModel: "nomic-embed-text", TopK: 5}}
+	}, RequireConfirm: true, ShowUsage: "summary", Documents: DocumentsConfig{Folder: "documents", EmbeddingProvider: "ollama", EmbeddingModel: "nomic-embed-text", TopK: 5}}
 }
 func Dir() (string, error) {
 	base, err := os.UserConfigDir()

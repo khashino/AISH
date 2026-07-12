@@ -20,15 +20,20 @@ type Client struct {
 	Model        string
 	APIKey       string
 	HTTP         *http.Client
+	last         provider.Usage
 }
 
 func New(name, baseURL, model, apiKey string) *Client {
 	return &Client{ProviderName: name, BaseURL: strings.TrimRight(baseURL, "/"), Model: model, APIKey: apiKey, HTTP: &http.Client{Timeout: 10 * time.Minute}}
 }
-func (c *Client) Name() string { return c.ProviderName }
+func (c *Client) Name() string              { return c.ProviderName }
+func (c *Client) LastUsage() provider.Usage { return c.last }
 
 func (c *Client) request(ctx context.Context, messages []provider.Message, stream bool) (*http.Response, error) {
 	body := map[string]any{"model": c.Model, "messages": messages, "stream": stream}
+	if stream {
+		body["stream_options"] = map[string]any{"include_usage": true}
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -63,6 +68,11 @@ func (c *Client) Chat(ctx context.Context, messages []provider.Message) (string,
 		Choices []struct {
 			Message provider.Message `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
@@ -70,6 +80,7 @@ func (c *Client) Chat(ctx context.Context, messages []provider.Message) (string,
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("%s returned no choices", c.ProviderName)
 	}
+	c.last = provider.Usage{InputTokens: result.Usage.PromptTokens, OutputTokens: result.Usage.CompletionTokens, TotalTokens: result.Usage.TotalTokens}
 	return result.Choices[0].Message.Content, nil
 }
 
@@ -98,8 +109,19 @@ func (c *Client) Stream(ctx context.Context, messages []provider.Message, emit p
 					Content string `json:"content"`
 				} `json:"delta"`
 			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage"`
 		}
-		if json.Unmarshal([]byte(data), &chunk) != nil || len(chunk.Choices) == 0 {
+		if json.Unmarshal([]byte(data), &chunk) != nil {
+			continue
+		}
+		if chunk.Usage != nil {
+			c.last = provider.Usage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens, TotalTokens: chunk.Usage.TotalTokens}
+		}
+		if len(chunk.Choices) == 0 {
 			continue
 		}
 		text := chunk.Choices[0].Delta.Content

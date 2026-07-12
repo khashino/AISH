@@ -17,12 +17,14 @@ import (
 type Client struct {
 	BaseURL, Model string
 	HTTP           *http.Client
+	last           provider.Usage
 }
 
 func New(baseURL, model string) *Client {
-	return &Client{strings.TrimRight(baseURL, "/"), model, &http.Client{Timeout: 10 * time.Minute}}
+	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Model: model, HTTP: &http.Client{Timeout: 10 * time.Minute}}
 }
-func (c *Client) Name() string { return "ollama" }
+func (c *Client) Name() string              { return "ollama" }
+func (c *Client) LastUsage() provider.Usage { return c.last }
 func (c *Client) request(ctx context.Context, messages []provider.Message, stream bool) (*http.Response, error) {
 	payload, err := json.Marshal(map[string]any{"model": c.Model, "messages": messages, "stream": stream})
 	if err != nil {
@@ -51,11 +53,14 @@ func (c *Client) Chat(ctx context.Context, messages []provider.Message) (string,
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Message provider.Message `json:"message"`
+		Message         provider.Message `json:"message"`
+		PromptEvalCount int              `json:"prompt_eval_count"`
+		EvalCount       int              `json:"eval_count"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
+	c.last = provider.Usage{InputTokens: out.PromptEvalCount, OutputTokens: out.EvalCount, TotalTokens: out.PromptEvalCount + out.EvalCount}
 	return out.Message.Content, nil
 }
 func (c *Client) Stream(ctx context.Context, messages []provider.Message, emit provider.StreamFunc) (string, error) {
@@ -70,8 +75,10 @@ func (c *Client) Stream(ctx context.Context, messages []provider.Message, emit p
 	s.Buffer(buf, 1024*1024)
 	for s.Scan() {
 		var part struct {
-			Message provider.Message `json:"message"`
-			Done    bool             `json:"done"`
+			Message         provider.Message `json:"message"`
+			Done            bool             `json:"done"`
+			PromptEvalCount int              `json:"prompt_eval_count"`
+			EvalCount       int              `json:"eval_count"`
 		}
 		if json.Unmarshal(s.Bytes(), &part) != nil {
 			continue
@@ -83,6 +90,7 @@ func (c *Client) Stream(ctx context.Context, messages []provider.Message, emit p
 			}
 		}
 		if part.Done {
+			c.last = provider.Usage{InputTokens: part.PromptEvalCount, OutputTokens: part.EvalCount, TotalTokens: part.PromptEvalCount + part.EvalCount}
 			break
 		}
 	}

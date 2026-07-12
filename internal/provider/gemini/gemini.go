@@ -16,15 +16,17 @@ import (
 type Client struct {
 	BaseURL, Model, APIKey string
 	HTTP                   *http.Client
+	last                   provider.Usage
 }
 
 func New(baseURL, model, apiKey string) *Client {
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com/v1beta"
 	}
-	return &Client{strings.TrimRight(baseURL, "/"), model, apiKey, &http.Client{Timeout: 10 * time.Minute}}
+	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Model: model, APIKey: apiKey, HTTP: &http.Client{Timeout: 10 * time.Minute}}
 }
-func (c *Client) Name() string { return "gemini" }
+func (c *Client) Name() string              { return "gemini" }
+func (c *Client) LastUsage() provider.Usage { return c.last }
 func (c *Client) Chat(ctx context.Context, messages []provider.Message) (string, error) {
 	contents := make([]map[string]any, 0, len(messages))
 	var system string
@@ -67,6 +69,11 @@ func (c *Client) Chat(ctx context.Context, messages []provider.Message) (string,
 				} `json:"parts"`
 			} `json:"content"`
 		} `json:"candidates"`
+		UsageMetadata struct {
+			PromptTokenCount     int `json:"promptTokenCount"`
+			CandidatesTokenCount int `json:"candidatesTokenCount"`
+			TotalTokenCount      int `json:"totalTokenCount"`
+		} `json:"usageMetadata"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
@@ -78,6 +85,7 @@ func (c *Client) Chat(ctx context.Context, messages []provider.Message) (string,
 	for _, p := range out.Candidates[0].Content.Parts {
 		b.WriteString(p.Text)
 	}
+	c.last = provider.Usage{InputTokens: out.UsageMetadata.PromptTokenCount, OutputTokens: out.UsageMetadata.CandidatesTokenCount, TotalTokens: out.UsageMetadata.TotalTokenCount}
 	return b.String(), nil
 }
 func (c *Client) Stream(ctx context.Context, m []provider.Message, emit provider.StreamFunc) (string, error) {

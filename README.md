@@ -237,3 +237,60 @@ git push origin v0.9.0
 - Incremental hashing for very large knowledge bases
 - Signed release checksums and update verification
 - Shell completion and package-manager manifests
+
+## v0.9.1 agent reliability
+
+Agent mode now includes deterministic plans for common Go project inspection tasks, rejects invalid project initialization commands when `go.mod` already exists, limits failed-command correction retries, saves interrupted tasks as paused, and accepts either the displayed task number or full task ID for `show`, `resume`, and `delete`.
+
+```bash
+aish agent list
+aish agent show 1
+aish agent resume 1
+aish agent delete 1
+```
+
+## Token usage and cost tracking (v1.0)
+
+AISH records token usage metadata for chat, one-shot questions, command planning, document answers, and agent tasks. Prompts and answers are not copied into the usage log.
+
+After a request, the default compact display is:
+
+```text
+[~1,558 tokens · 2.80s · ollama/qwen3.5:0.8b]
+```
+
+A `~` means the count is estimated. Providers that return usage metadata are recorded as exact.
+
+```bash
+aish usage
+aish usage today
+aish usage session my-project
+aish usage task 1
+aish usage export --format json
+aish usage export --format csv --output usage.csv
+aish usage reset
+```
+
+Inside interactive chat:
+
+```text
+/usage
+```
+
+Control the per-request display:
+
+```bash
+aish config set show-usage summary
+aish config set show-usage always
+aish config set show-usage off
+```
+
+Optional cost estimates use user-configured prices per one million tokens for the active provider/model:
+
+```bash
+aish pricing show
+aish pricing set input 0.15
+aish pricing set output 0.60
+```
+
+Prices are intentionally not hard-coded because provider pricing changes. Local providers default to `$0.00` API cost. Usage logs are encrypted when `AISH_ENCRYPTION_KEY` is set, using the same encrypted local-storage system as history and indexes.

@@ -33,9 +33,10 @@ import (
 	"github.com/khashino/AISH/internal/provider/ollama"
 	"github.com/khashino/AISH/internal/provider/openai"
 	"github.com/khashino/AISH/internal/provider/openaicompat"
+	usagepkg "github.com/khashino/AISH/internal/usage"
 )
 
-const version = "0.9.1-dev"
+const version = "1.0.0-dev"
 
 func Run(args []string) error {
 	cfg, e := config.Load()
@@ -63,6 +64,10 @@ func Run(args []string) error {
 		return knowledgeCommand(cfg, args[1:])
 	case "privacy":
 		return privacyCommand(cfg)
+	case "usage":
+		return usageCommand(cfg, args[1:])
+	case "pricing":
+		return pricingCommand(cfg, args[1:])
 	case "project":
 		if len(args) > 1 && args[1] == "context" {
 			fmt.Print(project.Context("."))
@@ -133,7 +138,53 @@ func client(cfg config.Config) (provider.Client, error) {
 	}
 	return nil, fmt.Errorf("unknown provider")
 }
-func streamAnswer(c provider.Client, m []provider.Message) (string, error) {
+func usageFromClient(c provider.Client, messages []provider.Message, answer string) provider.Usage {
+	if r, ok := c.(provider.UsageReporter); ok {
+		u := r.LastUsage()
+		if u.TotalTokens > 0 || u.InputTokens > 0 || u.OutputTokens > 0 {
+			if u.TotalTokens == 0 {
+				u.TotalTokens = u.InputTokens + u.OutputTokens
+			}
+			return u
+		}
+	}
+	return usagepkg.Estimate(messages, answer)
+}
+
+func recordUsage(cfg config.Config, c provider.Client, messages []provider.Message, answer, operation, taskID, session string, started time.Time, display bool) provider.Usage {
+	u := usageFromClient(c, messages, answer)
+	pc := cfg.Providers[cfg.ActiveProvider]
+	cost := float64(u.InputTokens)*pc.InputCostPerMillion/1_000_000 + float64(u.OutputTokens)*pc.OutputCostPerMillion/1_000_000
+	r := usagepkg.Record{Time: time.Now(), Provider: c.Name(), Model: pc.Model, Operation: operation, TaskID: taskID, Session: session, InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, TotalTokens: u.TotalTokens, Estimated: u.Estimated, DurationMS: time.Since(started).Milliseconds(), CostUSD: cost}
+	_ = usagepkg.Append(r)
+	if display && cfg.ShowUsage != "off" {
+		mark := ""
+		if u.Estimated {
+			mark = "~"
+		}
+		if cfg.ShowUsage == "always" {
+			fmt.Printf("Usage:\n  Input tokens:  %s%d\n  Output tokens: %s%d\n  Total tokens:  %s%d\n  Duration:      %.2fs\n", mark, u.InputTokens, mark, u.OutputTokens, mark, u.TotalTokens, float64(r.DurationMS)/1000)
+			if cost > 0 {
+				fmt.Printf("  Estimated cost: $%.6f\n", cost)
+			}
+		} else {
+			fmt.Printf("[%s%d tokens · %.2fs · %s/%s]\n", mark, u.TotalTokens, float64(r.DurationMS)/1000, c.Name(), pc.Model)
+		}
+	}
+	return u
+}
+
+func measuredChat(cfg config.Config, c provider.Client, m []provider.Message, operation, taskID, session string, display bool) (string, error) {
+	started := time.Now()
+	ans, err := c.Chat(context.Background(), m)
+	if err == nil {
+		recordUsage(cfg, c, m, ans, operation, taskID, session, started, display)
+	}
+	return ans, err
+}
+
+func streamAnswer(cfg config.Config, c provider.Client, m []provider.Message, operation, taskID, session string, display bool) (string, error) {
+	started := time.Now()
 	var mu sync.Mutex
 	first := true
 	done := make(chan struct{})
@@ -169,12 +220,15 @@ func streamAnswer(c provider.Client, m []provider.Message) (string, error) {
 	})
 	close(done)
 	mu.Lock()
-	defer mu.Unlock()
 	if first {
 		fmt.Print("\r\033[2K")
 	}
 	if ans != "" {
 		fmt.Println()
+	}
+	mu.Unlock()
+	if e == nil {
+		recordUsage(cfg, c, m, ans, operation, taskID, session, started, display)
 	}
 	return ans, e
 }
@@ -189,7 +243,7 @@ func ask(cfg config.Config, p string, extra []provider.Message) error {
 		return e
 	}
 	m := append(extra, provider.Message{Role: "user", Content: p})
-	a, e := streamAnswer(c, m)
+	a, e := streamAnswer(cfg, c, m, "ask", "", "", true)
 	if e == nil {
 		saveTurn(c, p, a, "")
 	}
@@ -238,12 +292,14 @@ func chat(cfg config.Config, session string) error {
 				sessionEntries = nil
 				fmt.Println("conversation cleared")
 			case text == "/help":
-				fmt.Println("/status /clear /history /save NAME /exit")
+				fmt.Println("/status /usage /clear /history /save NAME /exit")
 			case text == "/status":
 				pc := cfg.Providers[cfg.ActiveProvider]
 				fmt.Printf("provider=%s model=%s endpoint=%s turns=%d session=%s\n", cfg.ActiveProvider, pc.Model, pc.BaseURL, len(messages)/2, session)
 			case text == "/history":
 				_ = historyCommand()
+			case text == "/usage":
+				_ = printUsageSummary("Current session", usagepkg.Filter(mustUsage(), "", session))
 			case strings.HasPrefix(text, "/save "):
 				session = strings.TrimSpace(strings.TrimPrefix(text, "/save "))
 				_ = history.SaveSession(session, sessionEntries)
@@ -254,7 +310,7 @@ func chat(cfg config.Config, session string) error {
 			continue
 		}
 		messages = append(messages, provider.Message{Role: "user", Content: text})
-		a, e := streamAnswer(c, messages)
+		a, e := streamAnswer(cfg, c, messages, "chat", "", session, true)
 		if e != nil {
 			fmt.Println("error:", e)
 			messages = messages[:len(messages)-1]
@@ -360,7 +416,7 @@ func doCommand(cfg config.Config, task string) error {
 		sys := `You translate a user task into exactly one terminal command for the current OS. Return only JSON: {"command":"...","reason":"...","dangerous":false}. Never use markdown. Prefer simple portable commands. For numeric sorting, prefer sort -n or sort -nr instead of complex -k expressions. OS=` + runtime.GOOS
 		messages := []provider.Message{{Role: "system", Content: sys}, {Role: "user", Content: task}}
 		for attempt := 1; attempt <= 3; attempt++ {
-			raw, chatErr := c.Chat(context.Background(), messages)
+			raw, chatErr := measuredChat(cfg, c, messages, "do-plan", "", "", false)
 			if chatErr != nil {
 				return chatErr
 			}
@@ -388,7 +444,7 @@ func doCommand(cfg config.Config, task string) error {
 	out, runErr := executor.Capture(p.Command, 60*time.Second)
 	fmt.Print(out)
 	summaryPrompt := fmt.Sprintf("Task: %s\nCommand: %s\nOutput:\n%s\nExplain the result briefly and mention errors.", task, p.Command, out)
-	_, sumErr := streamAnswer(c, []provider.Message{{Role: "user", Content: summaryPrompt}})
+	_, sumErr := streamAnswer(cfg, c, []provider.Message{{Role: "user", Content: summaryPrompt}}, "do-summary", "", "", true)
 	if runErr != nil {
 		return runErr
 	}
@@ -587,6 +643,23 @@ func configCommand(cfg config.Config, a []string) error {
 			cfg.RequireConfirm = v != "false"
 		case "embedding-model":
 			cfg.Documents.EmbeddingModel = v
+		case "show-usage":
+			if v != "off" && v != "summary" && v != "always" {
+				return fmt.Errorf("show-usage must be off, summary, or always")
+			}
+			cfg.ShowUsage = v
+		case "pricing-input":
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return err
+			}
+			pc.InputCostPerMillion = f
+		case "pricing-output":
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return err
+			}
+			pc.OutputCostPerMillion = f
 		default:
 			return fmt.Errorf("unknown config key")
 		}
@@ -733,6 +806,8 @@ Commands:
   aish knowledge watch PATH    Watch and re-index changed files
   aish knowledge ask QUESTION  Answer with source path citations
   aish privacy                 Show local/cloud and encryption status
+  aish usage [today|session|task|export|reset]  Token, duration, and cost usage
+  aish pricing [show|set]      Configure optional cloud token prices
   aish setup                   Guided setup with WSL detection
   aish doctor                  Diagnose connectivity and model
   aish session list            List persistent sessions
@@ -846,13 +921,13 @@ func validateAgentPlanStep(command, cwd string) error {
 	return nil
 }
 
-func summarizeAgentTask(c provider.Client, t *agent.Task) {
+func summarizeAgentTask(cfg config.Config, c provider.Client, t *agent.Task) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Summarize this completed terminal task concisely. Goal: %s\n", t.Goal)
 	for i, s := range t.Steps {
 		fmt.Fprintf(&b, "Step %d: %s\nCommand: %s\nStatus: %s\nOutput:\n%s\nError: %s\n", i+1, s.Title, s.Command, s.Status, s.Output, s.Error)
 	}
-	raw, err := c.Chat(context.Background(), []provider.Message{{Role: "user", Content: b.String()}})
+	raw, err := measuredChat(cfg, c, []provider.Message{{Role: "user", Content: b.String()}}, "agent-summary", t.ID, "", false)
 	if err == nil && strings.TrimSpace(raw) != "" {
 		fmt.Println("\nSummary:")
 		fmt.Println(strings.TrimSpace(raw))
@@ -916,10 +991,11 @@ func agentCommand(cfg config.Config, args []string) error {
 		return e
 	}
 	cwd, _ := os.Getwd()
+	taskID := agent.New(goal, cwd, c.Name(), nil).ID
 	steps, deterministic := deterministicAgentPlan(goal, cwd)
 	if !deterministic {
 		prompt := `Create a safe, concise multi-step terminal plan. Return JSON only: {"steps":[{"title":"...","command":"..."}]}. Maximum 8 steps. Each step must be one valid, non-interactive command for OS ` + runtime.GOOS + `. Never invent AISH subcommands. Never initialize a project when project files already exist. Prefer inspection and test commands for inspection goals. Do not use sudo, destructive deletion, package installation, interactive editors, or markdown. Use the project context below.\n\n` + project.Context(cwd) + "\nGoal: " + goal
-		raw, chatErr := c.Chat(context.Background(), []provider.Message{{Role: "system", Content: "You are a careful terminal planning agent. Only propose commands that actually exist."}, {Role: "user", Content: prompt}})
+		raw, chatErr := measuredChat(cfg, c, []provider.Message{{Role: "system", Content: "You are a careful terminal planning agent. Only propose commands that actually exist."}, {Role: "user", Content: prompt}}, "agent-plan", taskID, "", false)
 		if chatErr != nil {
 			return chatErr
 		}
@@ -996,7 +1072,7 @@ func runAgentTask(cfg config.Config, t *agent.Task) error {
 			s.Status = "failed"
 			_ = agent.Save(*t)
 			fixPrompt := fmt.Sprintf("A command failed in an agent task. Return JSON only with corrected command and reason: {\"command\":\"...\",\"reason\":\"...\",\"dangerous\":false}. Goal: %s\nStep: %s\nFailed command: %s\nError/output: %s\nOS: %s", t.Goal, s.Title, s.Command, out+" "+runErr.Error(), runtime.GOOS)
-			raw, ce := c.Chat(context.Background(), []provider.Message{{Role: "user", Content: fixPrompt}})
+			raw, ce := measuredChat(cfg, c, []provider.Message{{Role: "user", Content: fixPrompt}}, "agent-correction", t.ID, "", false)
 			if ce == nil && s.Attempts < 2 {
 				if p, pe := parseProposal(raw, t.Goal); pe == nil && validateAgentPlanStep(p.Command, t.Workdir) == nil && strings.TrimSpace(p.Command) != strings.TrimSpace(s.Command) {
 					fmt.Printf("Suggested correction: %s\nRetry corrected command? [y/N]: ", p.Command)
@@ -1021,7 +1097,8 @@ func runAgentTask(cfg config.Config, t *agent.Task) error {
 	t.Status = "completed"
 	_ = agent.Save(*t)
 	fmt.Println("\nAgent task completed.")
-	summarizeAgentTask(c, t)
+	summarizeAgentTask(cfg, c, t)
+	printTaskUsage(t.ID)
 	return nil
 }
 
@@ -1168,4 +1245,130 @@ func privacyCommand(cfg config.Config) error {
 	}
 	fmt.Printf("AISH privacy\nProvider: %s\nProcessing: %s (%s)\nHistory/index encryption: %s\nAPI key storage: environment variable %s\nTelemetry: none\n", cfg.ActiveProvider, location, pc.BaseURL, encrypted, pc.APIKeyEnv)
 	return nil
+}
+
+func mustUsage() []usagepkg.Record {
+	xs, _ := usagepkg.ReadAll()
+	return xs
+}
+
+func printUsageSummary(title string, xs []usagepkg.Record) error {
+	s := usagepkg.Summarize(xs)
+	fmt.Println(title)
+	fmt.Printf("Requests:      %d\n", s.Requests)
+	fmt.Printf("Input tokens:  %d\n", s.InputTokens)
+	fmt.Printf("Output tokens: %d\n", s.OutputTokens)
+	fmt.Printf("Total tokens:  %d\n", s.TotalTokens)
+	fmt.Printf("Duration:      %.2fs\n", float64(s.DurationMS)/1000)
+	if s.CostUSD > 0 {
+		fmt.Printf("Estimated cost: $%.6f\n", s.CostUSD)
+	}
+	if s.EstimatedRecords > 0 {
+		fmt.Printf("Estimated records: %d/%d\n", s.EstimatedRecords, s.Requests)
+	}
+	return nil
+}
+
+func printTaskUsage(id string) {
+	xs, err := usagepkg.ReadAll()
+	if err != nil {
+		return
+	}
+	filtered := usagepkg.Filter(xs, id, "")
+	if len(filtered) == 0 {
+		return
+	}
+	fmt.Println()
+	_ = printUsageSummary("Agent usage", filtered)
+}
+
+func usageCommand(cfg config.Config, args []string) error {
+	xs, err := usagepkg.ReadAll()
+	if err != nil {
+		return err
+	}
+	if len(args) == 0 || args[0] == "all" {
+		if err := printUsageSummary("AISH usage — all time", xs); err != nil {
+			return err
+		}
+		by := usagepkg.ByProvider(xs)
+		if len(by) > 0 {
+			fmt.Println("\nBy provider:")
+			for _, name := range usagepkg.SortedProviders(by) {
+				s := by[name]
+				fmt.Printf("  %-12s %8d tokens  %d request(s)\n", name, s.TotalTokens, s.Requests)
+			}
+		}
+		return nil
+	}
+	switch args[0] {
+	case "today":
+		return printUsageSummary("AISH usage — today", usagepkg.Today(xs, time.Now()))
+	case "session":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: aish usage session NAME")
+		}
+		return printUsageSummary("AISH usage — session "+args[1], usagepkg.Filter(xs, "", args[1]))
+	case "task":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: aish usage task ID")
+		}
+		id, e := resolveAgentID(args[1])
+		if e != nil {
+			id = args[1]
+		}
+		return printUsageSummary("AISH usage — task "+id, usagepkg.Filter(xs, id, ""))
+	case "reset":
+		if !executor.Confirm("clear usage records", "Delete AISH usage metadata only", false) {
+			fmt.Println("Cancelled.")
+			return nil
+		}
+		return usagepkg.Reset()
+	case "export":
+		format, dest := "json", ""
+		for i := 1; i < len(args); i++ {
+			if args[i] == "--format" && i+1 < len(args) {
+				format = args[i+1]
+				i++
+			} else if args[i] == "--output" && i+1 < len(args) {
+				dest = args[i+1]
+				i++
+			}
+		}
+		if err := usagepkg.Export(format, dest, xs); err != nil {
+			return err
+		}
+		if dest == "" {
+			dest = "aish-usage." + format
+		}
+		fmt.Println("exported usage to", dest)
+		return nil
+	default:
+		return fmt.Errorf("usage: aish usage [today|session NAME|task ID|export --format json|csv [--output FILE]|reset]")
+	}
+}
+
+func pricingCommand(cfg config.Config, args []string) error {
+	pc := cfg.Providers[cfg.ActiveProvider]
+	if len(args) == 0 || args[0] == "show" {
+		fmt.Printf("Provider: %s\nModel: %s\nInput: $%.6f per 1M tokens\nOutput: $%.6f per 1M tokens\n", cfg.ActiveProvider, pc.Model, pc.InputCostPerMillion, pc.OutputCostPerMillion)
+		return nil
+	}
+	if args[0] == "set" && len(args) == 3 {
+		v, err := strconv.ParseFloat(args[2], 64)
+		if err != nil {
+			return err
+		}
+		switch args[1] {
+		case "input":
+			pc.InputCostPerMillion = v
+		case "output":
+			pc.OutputCostPerMillion = v
+		default:
+			return fmt.Errorf("usage: aish pricing set [input|output] COST_PER_MILLION")
+		}
+		cfg.Providers[cfg.ActiveProvider] = pc
+		return config.Save(cfg)
+	}
+	return fmt.Errorf("usage: aish pricing [show|set input COST|set output COST]")
 }

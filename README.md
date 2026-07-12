@@ -49,6 +49,9 @@ aish doctor                  Check connectivity and configured model
 aish session list            List saved sessions
 aish session open NAME       Continue a saved session
 aish docs add PATH           Index local documents
+aish docs list               List indexed documents
+aish docs remove PATH        Remove a file or folder from the index
+aish docs clear              Remove all indexed documents
 aish docs search QUERY       Semantic search
 aish docs ask QUESTION       Answer using local files
 aish provider use NAME       Switch AI provider
@@ -91,6 +94,8 @@ Then index and query files:
 ```bash
 aish docs add ./documents
 aish docs list
+aish docs remove ./documents/old-notes.md
+aish docs clear
 aish docs search "deployment"
 aish docs ask "How is the project deployed?"
 ```
@@ -143,14 +148,7 @@ go test ./...
 go build -o aish ./cmd/aish
 ```
 
-## Release
 
-Push a version tag. GitHub Actions builds Linux AMD64/ARM64, Windows AMD64, and macOS AMD64/ARM64 binaries and attaches them to a GitHub release.
-
-```bash
-git tag v0.6.0
-git push origin v0.6.0
-```
 
 ## Security
 
@@ -160,10 +158,3 @@ git push origin v0.6.0
 - Cloud API keys are read from environment variables, not stored in configuration.
 - Command validation is defense-in-depth, not a complete sandbox.
 
-## Roadmap
-
-- Stronger command policy and isolated execution
-- Native PDF extraction
-- Incremental document indexing
-- Signed release checksums and update verification
-- Shell completion and package-manager manifests

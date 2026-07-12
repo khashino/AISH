@@ -261,3 +261,69 @@ func List() (map[string]int, error) {
 	}
 	return m, nil
 }
+
+// Remove deletes all indexed chunks belonging to path. If path is a directory,
+// chunks for files below that directory are removed as well.
+func Remove(path string) (filesRemoved, chunksRemoved int, err error) {
+	s, err := load()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	targetClean := filepath.Clean(path)
+	targetAbs, absErr := filepath.Abs(targetClean)
+	if absErr != nil {
+		targetAbs = targetClean
+	}
+
+	removedFiles := make(map[string]struct{})
+	kept := make([]Chunk, 0, len(s.Chunks))
+	for _, c := range s.Chunks {
+		storedClean := filepath.Clean(c.Path)
+		storedAbs, storedAbsErr := filepath.Abs(storedClean)
+		if storedAbsErr != nil {
+			storedAbs = storedClean
+		}
+
+		matches := storedClean == targetClean || storedAbs == targetAbs
+		if !matches {
+			if rel, relErr := filepath.Rel(targetAbs, storedAbs); relErr == nil {
+				matches = rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+			}
+		}
+
+		if matches {
+			chunksRemoved++
+			removedFiles[c.Path] = struct{}{}
+			continue
+		}
+		kept = append(kept, c)
+	}
+
+	if chunksRemoved == 0 {
+		return 0, 0, nil
+	}
+	s.Chunks = kept
+	if err := save(s); err != nil {
+		return 0, 0, err
+	}
+	return len(removedFiles), chunksRemoved, nil
+}
+
+// Clear removes the complete local document index.
+func Clear() (filesRemoved, chunksRemoved int, err error) {
+	s, err := load()
+	if err != nil {
+		return 0, 0, err
+	}
+	files := make(map[string]struct{})
+	for _, c := range s.Chunks {
+		files[c.Path] = struct{}{}
+	}
+	chunksRemoved = len(s.Chunks)
+	filesRemoved = len(files)
+	if chunksRemoved == 0 {
+		return filesRemoved, chunksRemoved, nil
+	}
+	return filesRemoved, chunksRemoved, save(Store{})
+}

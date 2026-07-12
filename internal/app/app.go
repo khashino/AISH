@@ -28,7 +28,7 @@ import (
 	"github.com/khashino/AISH/internal/provider/openaicompat"
 )
 
-const version = "0.6.3-dev"
+const version = "0.6.4-dev"
 
 func Run(args []string) error {
 	cfg, e := config.Load()
@@ -603,7 +603,7 @@ func providerCommand(cfg config.Config, a []string) error {
 }
 func docsCommand(cfg config.Config, a []string) error {
 	if len(a) == 0 {
-		return fmt.Errorf("usage: aish docs [add|list|search|ask]")
+		return fmt.Errorf("usage: aish docs [add|list|remove|clear|search|ask]")
 	}
 	ep := cfg.Providers[cfg.Documents.EmbeddingProvider]
 	switch a[0] {
@@ -621,9 +621,40 @@ func docsCommand(cfg config.Config, a []string) error {
 		if e != nil {
 			return e
 		}
-		for p, n := range m {
-			fmt.Printf("%4d %s\n", n, p)
+		if len(m) == 0 {
+			fmt.Println("no indexed documents")
+			return nil
 		}
+		paths := make([]string, 0, len(m))
+		for p := range m {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		for _, p := range paths {
+			fmt.Printf("%4d %s\n", m[p], p)
+		}
+		return nil
+	case "remove", "delete", "rm":
+		if len(a) < 2 {
+			return fmt.Errorf("usage: aish docs remove PATH")
+		}
+		path := strings.Join(a[1:], " ")
+		files, chunks, e := documents.Remove(path)
+		if e != nil {
+			return e
+		}
+		if chunks == 0 {
+			fmt.Printf("no indexed documents matched %s\n", path)
+			return nil
+		}
+		fmt.Printf("removed %d file(s) and %d chunk(s)\n", files, chunks)
+		return nil
+	case "clear":
+		files, chunks, e := documents.Clear()
+		if e != nil {
+			return e
+		}
+		fmt.Printf("cleared %d file(s) and %d chunk(s)\n", files, chunks)
 		return nil
 	case "search", "ask":
 		if len(a) < 2 {
@@ -679,6 +710,9 @@ Commands:
   aish session list            List persistent sessions
   aish session open NAME       Continue a session
   aish docs add PATH           Index text, code, DOCX, and PDF
+  aish docs list               List indexed documents
+  aish docs remove PATH        Remove one file or folder from the index
+  aish docs clear              Remove the complete document index
   aish docs search QUERY       Search local documents
   aish docs ask QUESTION       RAG question
   aish provider use NAME       Switch provider

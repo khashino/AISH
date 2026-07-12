@@ -10,16 +10,23 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/khashino/AISH/internal/agent"
 	"github.com/khashino/AISH/internal/config"
 	"github.com/khashino/AISH/internal/documents"
 	"github.com/khashino/AISH/internal/executor"
 	"github.com/khashino/AISH/internal/history"
+	"github.com/khashino/AISH/internal/knowledge"
+	"github.com/khashino/AISH/internal/project"
 	"github.com/khashino/AISH/internal/provider"
 	"github.com/khashino/AISH/internal/provider/anthropic"
 	"github.com/khashino/AISH/internal/provider/gemini"
@@ -28,7 +35,7 @@ import (
 	"github.com/khashino/AISH/internal/provider/openaicompat"
 )
 
-const version = "0.6.4-dev"
+const version = "0.9.1-dev"
 
 func Run(args []string) error {
 	cfg, e := config.Load()
@@ -50,6 +57,18 @@ func Run(args []string) error {
 			return fmt.Errorf("usage: aish ask QUESTION")
 		}
 		return ask(cfg, strings.Join(args[1:], " "), nil)
+	case "agent":
+		return agentCommand(cfg, args[1:])
+	case "knowledge", "kb":
+		return knowledgeCommand(cfg, args[1:])
+	case "privacy":
+		return privacyCommand(cfg)
+	case "project":
+		if len(args) > 1 && args[1] == "context" {
+			fmt.Print(project.Context("."))
+			return nil
+		}
+		return fmt.Errorf("usage: aish project context")
 	case "do":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: aish do TASK")
@@ -704,7 +723,16 @@ func printHelp() {
 Commands:
   aish                         Interactive chat
   aish ask "QUESTION"          One question
-  aish do "TASK"               Propose, approve, run, and explain a command
+  aish do "TASK"               Propose, approve, run, and explain one command
+  aish agent "TASK"            Plan and run a resumable multi-step task
+  aish agent list              List saved agent tasks
+  aish agent resume ID         Resume a paused task
+  aish project context         Show detected project and Git context
+  aish knowledge create NAME   Create a personal knowledge collection
+  aish knowledge add PATH      Index files in the active collection
+  aish knowledge watch PATH    Watch and re-index changed files
+  aish knowledge ask QUESTION  Answer with source path citations
+  aish privacy                 Show local/cloud and encryption status
   aish setup                   Guided setup with WSL detection
   aish doctor                  Diagnose connectivity and model
   aish session list            List persistent sessions
@@ -724,3 +752,420 @@ Commands:
 }
 
 var _ = errors.Is
+
+type planResponse struct {
+	Steps []struct {
+		Title   string `json:"title"`
+		Command string `json:"command"`
+	} `json:"steps"`
+}
+
+func parsePlan(raw string) ([]agent.Step, error) {
+	text := strings.TrimSpace(raw)
+	if i := strings.Index(text, "{"); i >= 0 {
+		if j := strings.LastIndex(text, "}"); j > i {
+			text = text[i : j+1]
+		}
+	}
+	var p planResponse
+	if err := json.Unmarshal([]byte(text), &p); err != nil {
+		return nil, fmt.Errorf("invalid agent plan: %w", err)
+	}
+	if len(p.Steps) == 0 {
+		return nil, fmt.Errorf("agent returned an empty plan")
+	}
+	if len(p.Steps) > 12 {
+		return nil, fmt.Errorf("agent plan has too many steps (%d; max 12)", len(p.Steps))
+	}
+	out := make([]agent.Step, 0, len(p.Steps))
+	for _, s := range p.Steps {
+		if strings.TrimSpace(s.Command) == "" {
+			return nil, fmt.Errorf("plan step has empty command")
+		}
+		if err := executor.Validate(s.Command); err != nil {
+			return nil, fmt.Errorf("invalid step %q: %w", s.Title, err)
+		}
+		out = append(out, agent.Step{Title: s.Title, Command: s.Command, Status: "pending"})
+	}
+	return out, nil
+}
+
+func printAgentPlan(t agent.Task) {
+	fmt.Printf("Agent task: %s\nID: %s\nDirectory: %s\nPlan:\n", t.Goal, t.ID, t.Workdir)
+	for i, s := range t.Steps {
+		fmt.Printf("  %d. [%s] %s\n     %s\n", i+1, s.Status, s.Title, s.Command)
+	}
+}
+
+func resolveAgentID(value string) (string, error) {
+	if n, err := strconv.Atoi(value); err == nil {
+		tasks, listErr := agent.List()
+		if listErr != nil {
+			return "", listErr
+		}
+		if n < 1 || n > len(tasks) {
+			return "", fmt.Errorf("agent task number %d is out of range", n)
+		}
+		return tasks[n-1].ID, nil
+	}
+	return value, nil
+}
+
+func deterministicAgentPlan(goal, cwd string) ([]agent.Step, bool) {
+	g := strings.ToLower(goal)
+	_, goModErr := os.Stat(filepath.Join(cwd, "go.mod"))
+	isGo := goModErr == nil
+	if isGo && strings.Contains(g, "test") && (strings.Contains(g, "inspect") || strings.Contains(g, "go project") || strings.Contains(g, "summar")) {
+		steps := []agent.Step{
+			{Title: "Inspect Go environment", Command: "go version", Status: "pending"},
+			{Title: "Inspect module", Command: "go env GOMOD", Status: "pending"},
+			{Title: "Check Git status", Command: "git status --short", Status: "pending"},
+			{Title: "Run tests", Command: "go test ./...", Status: "pending"},
+			{Title: "Run static checks", Command: "go vet ./...", Status: "pending"},
+		}
+		return steps, true
+	}
+	return nil, false
+}
+
+func validateAgentPlanStep(command, cwd string) error {
+	if err := executor.Validate(command); err != nil {
+		return err
+	}
+	lower := strings.ToLower(strings.TrimSpace(command))
+	for _, bad := range []string{"aish summary", "aish run tests", "aish knowledge create", "aish docs add", "go mod init -v"} {
+		if strings.HasPrefix(lower, bad) {
+			return fmt.Errorf("unsupported or invalid agent command %q", command)
+		}
+	}
+	if strings.HasPrefix(lower, "go mod init") {
+		if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err == nil {
+			return fmt.Errorf("go.mod already exists; do not run go mod init")
+		}
+	}
+	return nil
+}
+
+func summarizeAgentTask(c provider.Client, t *agent.Task) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Summarize this completed terminal task concisely. Goal: %s\n", t.Goal)
+	for i, s := range t.Steps {
+		fmt.Fprintf(&b, "Step %d: %s\nCommand: %s\nStatus: %s\nOutput:\n%s\nError: %s\n", i+1, s.Title, s.Command, s.Status, s.Output, s.Error)
+	}
+	raw, err := c.Chat(context.Background(), []provider.Message{{Role: "user", Content: b.String()}})
+	if err == nil && strings.TrimSpace(raw) != "" {
+		fmt.Println("\nSummary:")
+		fmt.Println(strings.TrimSpace(raw))
+	}
+}
+
+func agentCommand(cfg config.Config, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: aish agent TASK | list | show ID | resume ID | delete ID")
+	}
+	switch args[0] {
+	case "list":
+		ts, e := agent.List()
+		if e != nil {
+			return e
+		}
+		for i, t := range ts {
+			fmt.Printf("%2d. %-40s %-9s %d/%d %s\n", i+1, t.ID, t.Status, t.Current, len(t.Steps), t.Goal)
+		}
+		return nil
+	case "show":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: aish agent show ID")
+		}
+		id, e := resolveAgentID(args[1])
+		if e != nil {
+			return e
+		}
+		t, e := agent.Load(id)
+		if e != nil {
+			return e
+		}
+		printAgentPlan(t)
+		return nil
+	case "delete":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: aish agent delete ID")
+		}
+		id, e := resolveAgentID(args[1])
+		if e != nil {
+			return e
+		}
+		return agent.Delete(id)
+	case "resume":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: aish agent resume ID")
+		}
+		id, e := resolveAgentID(args[1])
+		if e != nil {
+			return e
+		}
+		t, e := agent.Load(id)
+		if e != nil {
+			return e
+		}
+		return runAgentTask(cfg, &t)
+	}
+	goal := strings.Join(args, " ")
+	c, e := client(cfg)
+	if e != nil {
+		return e
+	}
+	cwd, _ := os.Getwd()
+	steps, deterministic := deterministicAgentPlan(goal, cwd)
+	if !deterministic {
+		prompt := `Create a safe, concise multi-step terminal plan. Return JSON only: {"steps":[{"title":"...","command":"..."}]}. Maximum 8 steps. Each step must be one valid, non-interactive command for OS ` + runtime.GOOS + `. Never invent AISH subcommands. Never initialize a project when project files already exist. Prefer inspection and test commands for inspection goals. Do not use sudo, destructive deletion, package installation, interactive editors, or markdown. Use the project context below.\n\n` + project.Context(cwd) + "\nGoal: " + goal
+		raw, chatErr := c.Chat(context.Background(), []provider.Message{{Role: "system", Content: "You are a careful terminal planning agent. Only propose commands that actually exist."}, {Role: "user", Content: prompt}})
+		if chatErr != nil {
+			return chatErr
+		}
+		steps, e = parsePlan(raw)
+		if e != nil {
+			return e
+		}
+	}
+	for _, step := range steps {
+		if e := validateAgentPlanStep(step.Command, cwd); e != nil {
+			return fmt.Errorf("invalid plan step %q: %w", step.Title, e)
+		}
+	}
+	t := agent.New(goal, cwd, c.Name(), steps)
+	if e = agent.Save(t); e != nil {
+		return e
+	}
+	printAgentPlan(t)
+	return runAgentTask(cfg, &t)
+}
+
+func runAgentTask(cfg config.Config, t *agent.Task) error {
+	c, e := client(cfg)
+	if e != nil {
+		return e
+	}
+	in := bufio.NewReader(os.Stdin)
+	t.Status = "running"
+	_ = agent.Save(*t)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
+	go func() {
+		<-sig
+		t.Status = "paused"
+		_ = agent.Save(*t)
+		fmt.Printf("\nAgent task paused. Resume with: aish agent resume %s\n", t.ID)
+		os.Exit(130)
+	}()
+	for t.Current < len(t.Steps) {
+		s := &t.Steps[t.Current]
+		fmt.Printf("\nStep %d/%d: %s\nCommand: %s\nApprove? [y]es/[s]kip/[p]ause/[c]ancel: ", t.Current+1, len(t.Steps), s.Title, s.Command)
+		ans, _ := in.ReadString('\n')
+		ans = strings.ToLower(strings.TrimSpace(ans))
+		switch ans {
+		case "c", "cancel":
+			t.Status = "cancelled"
+			_ = agent.Save(*t)
+			fmt.Println("Agent task cancelled.")
+			return nil
+		case "p", "pause", "":
+			t.Status = "paused"
+			_ = agent.Save(*t)
+			fmt.Println("Agent task paused. Resume with: aish agent resume " + t.ID)
+			return nil
+		case "s", "skip":
+			s.Status = "skipped"
+			t.Current++
+			_ = agent.Save(*t)
+			continue
+		case "y", "yes":
+		default:
+			fmt.Println("Please choose y, s, p, or c.")
+			continue
+		}
+		s.Status = "running"
+		_ = agent.Save(*t)
+		out, runErr := executor.Capture(s.Command, 2*time.Minute)
+		fmt.Print(out)
+		if runErr != nil {
+			s.Attempts++
+			s.Error = runErr.Error()
+			s.Output = out
+			s.Status = "failed"
+			_ = agent.Save(*t)
+			fixPrompt := fmt.Sprintf("A command failed in an agent task. Return JSON only with corrected command and reason: {\"command\":\"...\",\"reason\":\"...\",\"dangerous\":false}. Goal: %s\nStep: %s\nFailed command: %s\nError/output: %s\nOS: %s", t.Goal, s.Title, s.Command, out+" "+runErr.Error(), runtime.GOOS)
+			raw, ce := c.Chat(context.Background(), []provider.Message{{Role: "user", Content: fixPrompt}})
+			if ce == nil && s.Attempts < 2 {
+				if p, pe := parseProposal(raw, t.Goal); pe == nil && validateAgentPlanStep(p.Command, t.Workdir) == nil && strings.TrimSpace(p.Command) != strings.TrimSpace(s.Command) {
+					fmt.Printf("Suggested correction: %s\nRetry corrected command? [y/N]: ", p.Command)
+					a, _ := in.ReadString('\n')
+					if strings.EqualFold(strings.TrimSpace(a), "y") {
+						s.Command = p.Command
+						s.Status = "pending"
+						_ = agent.Save(*t)
+						continue
+					}
+				}
+			}
+			t.Status = "paused"
+			_ = agent.Save(*t)
+			return fmt.Errorf("step failed; task saved for resume: %s", t.ID)
+		}
+		s.Output = out
+		s.Status = "done"
+		t.Current++
+		_ = agent.Save(*t)
+	}
+	t.Status = "completed"
+	_ = agent.Save(*t)
+	fmt.Println("\nAgent task completed.")
+	summarizeAgentTask(c, t)
+	return nil
+}
+
+func knowledgeCommand(cfg config.Config, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: aish knowledge [create|list|use|add|watch|search|ask|remove|clear|delete]")
+	}
+	ep := cfg.Providers[cfg.Documents.EmbeddingProvider]
+	r, e := knowledge.Load()
+	if e != nil {
+		return e
+	}
+	active := r.Active
+	switch args[0] {
+	case "create":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: aish knowledge create NAME")
+		}
+		if _, ok := r.Collections[args[1]]; ok {
+			_ = knowledge.Use(args[1])
+			fmt.Printf("collection %s already exists and is now active\n", args[1])
+			return nil
+		}
+		if e := knowledge.Create(args[1]); e != nil {
+			return e
+		}
+		fmt.Printf("created collection %s\n", args[1])
+		return nil
+	case "list":
+		cs, a, e := knowledge.List()
+		if e != nil {
+			return e
+		}
+		for _, c := range cs {
+			m := " "
+			if c.Name == a {
+				m = "*"
+			}
+			fmt.Printf("%s %-20s %d path(s)\n", m, c.Name, len(c.Paths))
+		}
+		return nil
+	case "use":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: aish knowledge use NAME")
+		}
+		if e := knowledge.Use(args[1]); e != nil {
+			return e
+		}
+		fmt.Printf("active knowledge collection: %s\n", args[1])
+		return nil
+	case "delete":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: aish knowledge delete NAME")
+		}
+		return knowledge.Delete(args[1])
+	case "add":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: aish knowledge add [NAME] PATH")
+		}
+		name, path := active, strings.Join(args[1:], " ")
+		if len(args) >= 3 {
+			if _, ok := r.Collections[args[1]]; ok {
+				name = args[1]
+				path = strings.Join(args[2:], " ")
+			}
+		}
+		n, e := knowledge.AddPath(name, path, ep.BaseURL, cfg.Documents.EmbeddingModel)
+		if e == nil {
+			fmt.Printf("indexed %d chunks into %s\n", n, name)
+		}
+		return e
+	case "watch":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: aish knowledge watch [NAME] PATH")
+		}
+		name, path := active, strings.Join(args[1:], " ")
+		if len(args) >= 3 {
+			if _, ok := r.Collections[args[1]]; ok {
+				name = args[1]
+				path = strings.Join(args[2:], " ")
+			}
+		}
+		return knowledge.Watch(name, path, ep.BaseURL, cfg.Documents.EmbeddingModel, 5*time.Second)
+	case "remove":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: aish knowledge remove [NAME] PATH")
+		}
+		name, path := active, strings.Join(args[1:], " ")
+		if len(args) >= 3 {
+			if _, ok := r.Collections[args[1]]; ok {
+				name = args[1]
+				path = strings.Join(args[2:], " ")
+			}
+		}
+		f, ch, e := documents.RemoveFrom(name, path)
+		if e == nil {
+			fmt.Printf("removed %d file(s), %d chunk(s) from %s\n", f, ch, name)
+		}
+		return e
+	case "clear":
+		name := active
+		if len(args) == 2 {
+			name = args[1]
+		}
+		f, ch, e := documents.ClearCollection(name)
+		if e == nil {
+			fmt.Printf("cleared %d file(s), %d chunk(s) from %s\n", f, ch, name)
+		}
+		return e
+	case "search", "ask":
+		if len(args) < 2 {
+			return fmt.Errorf("query required")
+		}
+		q := strings.Join(args[1:], " ")
+		cs, e := documents.SearchIn(context.Background(), active, q, ep.BaseURL, cfg.Documents.EmbeddingModel, cfg.Documents.TopK)
+		if e != nil {
+			return e
+		}
+		if args[0] == "search" {
+			for i, x := range cs {
+				fmt.Printf("\n[%d] %s\n%s\n", i+1, x.Path, x.Text)
+			}
+			return nil
+		}
+		var b strings.Builder
+		b.WriteString("Answer only from these personal knowledge sources. Cite each claim with [source: PATH]. If context is insufficient, say so.\n")
+		for _, x := range cs {
+			fmt.Fprintf(&b, "SOURCE %s\n%s\n", x.Path, x.Text)
+		}
+		return ask(cfg, q, []provider.Message{{Role: "system", Content: b.String()}})
+	}
+	return fmt.Errorf("unknown knowledge command")
+}
+
+func privacyCommand(cfg config.Config) error {
+	pc := cfg.Providers[cfg.ActiveProvider]
+	location := "cloud provider"
+	if cfg.ActiveProvider == "ollama" || cfg.ActiveProvider == "llamacpp" {
+		location = "local endpoint"
+	}
+	encrypted := "disabled"
+	if os.Getenv("AISH_ENCRYPTION_KEY") != "" {
+		encrypted = "enabled (AES-GCM)"
+	}
+	fmt.Printf("AISH privacy\nProvider: %s\nProcessing: %s (%s)\nHistory/index encryption: %s\nAPI key storage: environment variable %s\nTelemetry: none\n", cfg.ActiveProvider, location, pc.BaseURL, encrypted, pc.APIKeyEnv)
+	return nil
+}

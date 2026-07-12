@@ -60,6 +60,71 @@ aish run "COMMAND"           Run an exact command after approval
 aish version                 Show version
 ```
 
+
+## Agent mode (v0.8)
+
+AISH can create a multi-step plan using the current folder and Git repository as context:
+
+```bash
+aish agent "inspect this Go project, run tests, and summarize failures"
+```
+
+Each step shows its command and requires one of: approve, skip, pause, or cancel. Tasks are saved locally and can be resumed:
+
+```bash
+aish agent list
+aish agent show TASK_ID
+aish agent resume TASK_ID
+aish agent delete TASK_ID
+```
+
+Failed commands are sent back to the active model for a corrected proposal. AISH asks before retrying the correction.
+
+Project and Git context can be inspected directly:
+
+```bash
+aish project context
+```
+
+## Personal knowledge (v0.9)
+
+Create separate knowledge collections for personal, work, study, or individual projects:
+
+```bash
+aish knowledge create personal
+aish knowledge create work
+aish knowledge list
+aish knowledge use personal
+aish knowledge add ~/Documents
+aish knowledge search "insurance renewal"
+aish knowledge ask "When does my insurance renew?"
+```
+
+Answers are instructed to cite indexed source paths. Watch a folder and automatically re-index changed files until Ctrl+C:
+
+```bash
+aish knowledge watch ~/Documents/notes
+```
+
+Manage collection content:
+
+```bash
+aish knowledge remove ~/Documents/old-note.md
+aish knowledge clear personal
+aish knowledge delete work
+```
+
+### Optional encrypted local storage
+
+Set an encryption passphrase before using AISH:
+
+```bash
+export AISH_ENCRYPTION_KEY='a long private passphrase'
+aish privacy
+```
+
+When set, newly written history, sessions, agent state, collection metadata, and vector indexes are encrypted locally with AES-GCM. Keep the passphrase safe: encrypted data cannot be opened without it. Existing unencrypted data remains readable and is encrypted the next time it is saved.
+
 ## Natural-language commands
 
 ```bash
@@ -148,7 +213,14 @@ go test ./...
 go build -o aish ./cmd/aish
 ```
 
+## Release
 
+Push a version tag. GitHub Actions builds Linux AMD64/ARM64, Windows AMD64, and macOS AMD64/ARM64 binaries and attaches them to a GitHub release.
+
+```bash
+git tag v0.9.0
+git push origin v0.9.0
+```
 
 ## Security
 
@@ -158,3 +230,10 @@ go build -o aish ./cmd/aish
 - Cloud API keys are read from environment variables, not stored in configuration.
 - Command validation is defense-in-depth, not a complete sandbox.
 
+## Roadmap
+
+- Stronger command sandboxing and policy profiles
+- Page-aware PDF citations and richer DOCX metadata
+- Incremental hashing for very large knowledge bases
+- Signed release checksums and update verification
+- Shell completion and package-manager manifests

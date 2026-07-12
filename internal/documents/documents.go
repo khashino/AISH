@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"math"
@@ -16,26 +17,33 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/khashino/AISH/internal/securestore"
 )
 
 type Chunk struct {
 	Path   string    `json:"path"`
 	Text   string    `json:"text"`
 	Vector []float64 `json:"vector"`
+	Page   int       `json:"page,omitempty"`
 }
 type Store struct {
 	Chunks []Chunk `json:"chunks"`
 }
 
-func indexPath() (string, error) {
+func indexPathFor(collection string) (string, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "aish", "documents.json"), nil
+	if collection == "" || collection == "default" {
+		return filepath.Join(base, "aish", "documents.json"), nil
+	}
+	collection = regexp.MustCompile(`[^a-zA-Z0-9_-]+`).ReplaceAllString(collection, "-")
+	return filepath.Join(base, "aish", "knowledge", collection+".json"), nil
 }
-func load() (Store, error) {
-	p, err := indexPath()
+func loadFrom(collection string) (Store, error) {
+	p, err := indexPathFor(collection)
 	if err != nil {
 		return Store{}, err
 	}
@@ -46,12 +54,16 @@ func load() (Store, error) {
 	if err != nil {
 		return Store{}, err
 	}
+	b, err = securestore.Decrypt(b)
+	if err != nil {
+		return Store{}, err
+	}
 	var s Store
 	err = json.Unmarshal(b, &s)
 	return s, err
 }
-func save(s Store) error {
-	p, err := indexPath()
+func saveTo(collection string, s Store) error {
+	p, err := indexPathFor(collection)
 	if err != nil {
 		return err
 	}
@@ -59,6 +71,10 @@ func save(s Store) error {
 		return err
 	}
 	b, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	b, err = securestore.Encrypt(b)
 	if err != nil {
 		return err
 	}
@@ -108,12 +124,34 @@ func readText(path string) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			data, _ := io.ReadAll(rc)
+			dec := xml.NewDecoder(rc)
+			for {
+				tok, err := dec.Token()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					rc.Close()
+					return nil, err
+				}
+				switch v := tok.(type) {
+				case xml.CharData:
+					text := strings.TrimSpace(string(v))
+					if text != "" {
+						if b.Len() > 0 {
+							b.WriteByte(' ')
+						}
+						b.WriteString(text)
+					}
+				case xml.EndElement:
+					if v.Name.Local == "p" {
+						b.WriteByte('\n')
+					}
+				}
+			}
 			rc.Close()
-			re := regexp.MustCompile(`<[^>]+>`)
-			b.WriteString(re.ReplaceAllString(string(data), " "))
 		}
-		return []byte(b.String()), nil
+		return []byte(strings.TrimSpace(b.String())), nil
 	}
 	if ext == ".pdf" {
 		if _, err := exec.LookPath("pdftotext"); err != nil {
@@ -149,6 +187,9 @@ func split(text string) []string {
 	return out
 }
 func Add(ctx context.Context, path, baseURL, model string) (int, error) {
+	return AddTo(ctx, "default", path, baseURL, model)
+}
+func AddTo(ctx context.Context, collection, path, baseURL, model string) (int, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return 0, err
@@ -173,7 +214,7 @@ func Add(ctx context.Context, path, baseURL, model string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	s, err := load()
+	s, err := loadFrom(collection)
 	if err != nil {
 		return 0, err
 	}
@@ -203,7 +244,7 @@ func Add(ctx context.Context, path, baseURL, model string) (int, error) {
 			count++
 		}
 	}
-	return count, save(s)
+	return count, saveTo(collection, s)
 }
 func cosine(a, b []float64) float64 {
 	if len(a) != len(b) || len(a) == 0 {
@@ -221,7 +262,10 @@ func cosine(a, b []float64) float64 {
 	return dot / (math.Sqrt(aa) * math.Sqrt(bb))
 }
 func Search(ctx context.Context, query, baseURL, model string, k int) ([]Chunk, error) {
-	s, err := load()
+	return SearchIn(ctx, "default", query, baseURL, model, k)
+}
+func SearchIn(ctx context.Context, collection, query, baseURL, model string, k int) ([]Chunk, error) {
+	s, err := loadFrom(collection)
 	if err != nil {
 		return nil, err
 	}
@@ -250,8 +294,9 @@ func Search(ctx context.Context, query, baseURL, model string, k int) ([]Chunk, 
 	}
 	return out, nil
 }
-func List() (map[string]int, error) {
-	s, err := load()
+func List() (map[string]int, error) { return ListIn("default") }
+func ListIn(collection string) (map[string]int, error) {
+	s, err := loadFrom(collection)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +310,10 @@ func List() (map[string]int, error) {
 // Remove deletes all indexed chunks belonging to path. If path is a directory,
 // chunks for files below that directory are removed as well.
 func Remove(path string) (filesRemoved, chunksRemoved int, err error) {
-	s, err := load()
+	return RemoveFrom("default", path)
+}
+func RemoveFrom(collection, path string) (filesRemoved, chunksRemoved int, err error) {
+	s, err := loadFrom(collection)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -304,15 +352,16 @@ func Remove(path string) (filesRemoved, chunksRemoved int, err error) {
 		return 0, 0, nil
 	}
 	s.Chunks = kept
-	if err := save(s); err != nil {
+	if err := saveTo(collection, s); err != nil {
 		return 0, 0, err
 	}
 	return len(removedFiles), chunksRemoved, nil
 }
 
 // Clear removes the complete local document index.
-func Clear() (filesRemoved, chunksRemoved int, err error) {
-	s, err := load()
+func Clear() (filesRemoved, chunksRemoved int, err error) { return ClearCollection("default") }
+func ClearCollection(collection string) (filesRemoved, chunksRemoved int, err error) {
+	s, err := loadFrom(collection)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -325,5 +374,9 @@ func Clear() (filesRemoved, chunksRemoved int, err error) {
 	if chunksRemoved == 0 {
 		return filesRemoved, chunksRemoved, nil
 	}
-	return filesRemoved, chunksRemoved, save(Store{})
+	return filesRemoved, chunksRemoved, saveTo(collection, Store{})
 }
+
+// compatibility helpers for existing tests and default document index.
+func load() (Store, error) { return loadFrom("default") }
+func save(s Store) error   { return saveTo("default", s) }

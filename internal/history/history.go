@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/khashino/AISH/internal/securestore"
 )
 
 type Entry struct {
@@ -40,7 +42,16 @@ func Append(e Entry) error {
 		return err
 	}
 	defer f.Close()
-	return json.NewEncoder(f).Encode(e)
+	b, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	b, err = securestore.Encrypt(b)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(append(b, '\n'))
+	return err
 }
 func ReadAll() ([]Entry, error) {
 	p, e := path()
@@ -58,8 +69,12 @@ func ReadAll() ([]Entry, error) {
 	var out []Entry
 	s := bufio.NewScanner(f)
 	for s.Scan() {
+		b, decErr := securestore.Decrypt(append([]byte(nil), s.Bytes()...))
+		if decErr != nil {
+			return nil, decErr
+		}
 		var x Entry
-		if json.Unmarshal(s.Bytes(), &x) == nil {
+		if json.Unmarshal(b, &x) == nil {
 			out = append(out, x)
 		}
 	}
@@ -77,6 +92,10 @@ func loadSessions() (map[string]Session, error) {
 	if e != nil {
 		return nil, e
 	}
+	b, e = securestore.Decrypt(b)
+	if e != nil {
+		return nil, e
+	}
 	m := map[string]Session{}
 	e = json.Unmarshal(b, &m)
 	return m, e
@@ -88,6 +107,10 @@ func saveSessions(m map[string]Session) error {
 	}
 	os.MkdirAll(filepath.Dir(p), 0700)
 	b, e := json.MarshalIndent(m, "", "  ")
+	if e != nil {
+		return e
+	}
+	b, e = securestore.Encrypt(b)
 	if e != nil {
 		return e
 	}

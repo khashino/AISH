@@ -1,72 +1,45 @@
 $ErrorActionPreference = "Stop"
 
-$repo = if ($env:AISH_REPO) {
-    $env:AISH_REPO
-} else {
-    "khashino/AISH"
-}
+$repo = "khashino/AISH"
+$version = if ($env:AISH_VERSION) { $env:AISH_VERSION } else { "v0.6.4" }
 
-$requestedVersion = if ($env:AISH_VERSION) {
-    $env:AISH_VERSION
-} else {
-    "latest"
-}
-
-$installDir = if ($env:AISH_INSTALL_DIR) {
-    $env:AISH_INSTALL_DIR
-} else {
-    "$env:LOCALAPPDATA\AISH\bin"
-}
-
-if ($requestedVersion -eq "latest") {
-    Write-Host "Finding latest AISH release..."
-
-    $latestUrl = curl.exe -fsSL `
-        -o NUL `
-        -w "%{url_effective}" `
-        "https://github.com/$repo/releases/latest"
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to determine the latest AISH release."
-    }
-
-    $version = ($latestUrl.TrimEnd("/") -split "/")[-1]
-} else {
-    $version = $requestedVersion
-
-    if (-not $version.StartsWith("v")) {
-        $version = "v$version"
-    }
+if (-not $version.StartsWith("v")) {
+    $version = "v$version"
 }
 
 $versionNumber = $version.TrimStart("v")
 $asset = "aish-v$versionNumber-windows-amd64.exe"
 $url = "https://github.com/$repo/releases/download/$version/$asset"
 
-New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+$dest = if ($env:AISH_INSTALL_DIR) {
+    $env:AISH_INSTALL_DIR
+} else {
+    "$env:LOCALAPPDATA\AISH\bin"
+}
 
-$tempFile = Join-Path $env:TEMP "aish-download.exe"
-$destination = Join-Path $installDir "aish.exe"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+$tempFile = Join-Path $env:TEMP $asset
+$target = Join-Path $dest "aish.exe"
 
 Write-Host "Downloading AISH $version..."
-Write-Host "Asset: $asset"
+Write-Host $url
 
-curl.exe -fL --progress-bar $url -o $tempFile
+curl.exe -fL $url -o $tempFile
 
 if ($LASTEXITCODE -ne 0) {
-    Remove-Item $tempFile -ErrorAction SilentlyContinue
     throw "Download failed: $url"
 }
 
-Move-Item -Force $tempFile $destination
+Move-Item -Force $tempFile $target
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 
-if ($userPath -notlike "*$installDir*") {
+if ($userPath -notlike "*$dest*") {
     $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) {
-        $installDir
+        $dest
     } else {
-        "$userPath;$installDir"
+        "$userPath;$dest"
     }
 
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
@@ -74,9 +47,9 @@ if ($userPath -notlike "*$installDir*") {
 }
 
 Write-Host ""
-Write-Host "Installed AISH $version:"
-Write-Host "  $destination"
+Write-Host "Installed AISH to:"
+Write-Host "  $target"
 Write-Host ""
-Write-Host "Open a new PowerShell window, then run:"
+Write-Host "Open a new PowerShell window and run:"
+Write-Host "  aish version"
 Write-Host "  aish setup"
-Write-Host "  aish doctor"
